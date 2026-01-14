@@ -1,0 +1,451 @@
+library(sf)
+library(terra)
+library(nnet) 
+library(caret)
+library(corrplot)
+
+# PREDITORES: Nomes das camadas no modelo (ajuste se você removeu camadas)
+VAR_PREDITORAS_MODELO <- c("mapbiom_t", "ASD", "Hydrography", "INCRA", "Mining", 
+                           "QuilombolaLand", "Railways", "ProtectedArea", "Slope")
+
+# --- PARTE 1: PREPARAÇÃO E RECLASSIFICAÇÃO DO LULC (MAPBIOMAS) ---
+## Objetivo: Garantir que todos os rasters MapBiomas (1990, 2000, 2010, 2020) 
+## tenham o mesmo conjunto de classes (categorias).
+
+message("--- PARTE 1: Preparação e Reclassificação do LULC ---")
+
+# 1.1 Carregamento e Recorte
+ref_layer <- st_read("shapes/shapes_utm/ASD_norte.shp")
+ref_layer_vect <- vect(ref_layer)
+
+pasta_mapbiom <- "rasters/mapbiomas_semiarido_utm"
+arquivos_mapbiom <- list.files(pasta_mapbiom, pattern = ".*\\.tif$", full.names = TRUE)
+
+mapbiom <- rast(arquivos_mapbiom)
+mapbiom_crop <- crop(mapbiom, ref_layer_vect)
+mapbiom_mask <- mask(mapbiom_crop, ref_layer_vect)
+
+# 1.2 Salvamento dos Recortes
+DIR_MAPBIOM_RECORTE <- "rasters/molusce_inputs/mapbiom_recortado"
+dir.create(DIR_MAPBIOM_RECORTE, showWarnings = FALSE, recursive = TRUE)
+
+for (i in 1:nlyr(mapbiom_mask)) {
+  nome <- names(mapbiom_mask)[i]
+  saida <- file.path(DIR_MAPBIOM_RECORTE, paste0("mask", nome, ".tif"))
+  writeRaster(mapbiom_mask[[i]], saida, overwrite=TRUE, NAflag=-9999, gdal=c("COMPRESS=LZW"))
+}
+
+# 1.3 Definição da Lista Mestre de Classes
+docs_reco <- list.files(DIR_MAPBIOM_RECORTE, pattern = ".*\\.tif$", full.names = TRUE)
+rasters_lulc_orig <- lapply(docs_reco, rast)
+
+classes_por_raster <- lapply(rasters_lulc_orig, function(r) unique(values(r, na.rm=TRUE)))
+# Combina todas as classes e inclui o '0' para classes ausentes
+classes_mestre <- sort(unique(c(unlist(classes_por_raster), 0)))
+message(paste("Classes mestres de LULC: ", paste(classes_mestre, collapse = ", ")))
+
+# 1.4 Função de Reclassificação Consistente
+cria_tabela_mestre <- function(r, classes_mestre) {
+  presentes <- unique(values(r, na.rm=TRUE))
+  matriz <- data.frame(
+    from = classes_mestre,
+    to   = ifelse(classes_mestre %in% presentes, classes_mestre, 0) # Classes ausentes viram 0
+  )
+  return(as.matrix(matriz))
+}
+
+# 1.5 Aplicação da Reclassificação e Salvamento
+DIR_MAPBIOM_RECLASS <- "rasters/molusce_inputs/reclass"
+dir.create(DIR_MAPBIOM_RECLASS, showWarnings = FALSE, recursive = TRUE)
+
+rasters_reclass <- mapply(function(r, nome) {
+  tab <- cria_tabela_mestre(r, classes_mestre)
+  r2 <- classify(r, tab) 
+  
+  saida <- file.path(DIR_MAPBIOM_RECLASS, paste0("reclass_", basename(nome)))
+  # Tipo INT4U é bom para dados categóricos no MOLUSCE
+  writeRaster(r2, saida, overwrite=TRUE, datatype='INT4U', NAflag=-9999, gdal=c("COMPRESS=LZW"))
+  return(r2)
+}, rasters_lulc_orig, docs_reco, SIMPLIFY=FALSE)
+
+message("✅ Reclassificação do LULC concluída. Classes consistentes.")
+
+# Definir os rasters de LULC para uso futuro
+mapbiom_1990_rast <- rast(grep("1990.tif$", list.files(DIR_MAPBIOM_RECLASS, full.names = TRUE), value = TRUE)[1])
+mapbiom_2000_rast <- rast(grep("2000.tif$", list.files(DIR_MAPBIOM_RECLASS, full.names = TRUE), value = TRUE)[1])
+mapbiom_2010_rast <- rast(grep("2010.tif$", list.files(DIR_MAPBIOM_RECLASS, full.names = TRUE), value = TRUE)[1])
+mapbiom_2015_rast <- rast(grep("2015.tif$", list.files(DIR_MAPBIOM_RECLASS, full.names = TRUE), value = TRUE)[1])
+mapbiom_2020_rast <- rast(grep("2020.tif$", list.files(DIR_MAPBIOM_RECLASS, full.names = TRUE), value = TRUE)[1])
+
+
+# --- PARTE 2: PREPARAÇÃO E ALINHAMENTO DAS VARIÁVEIS EXPLICATIVAS ---
+## Objetivo: Garantir que todas as preditoras sejam alinhadas à geometria do LULC.
+
+message("\n--- PARTE 2: Preparação e Alinhamento das Variáveis Explicativas ---")
+
+# 2.1 Lista de Arquivos Explicativos
+var_exp_paths <- c("arquivos/shapes_utm/shapes_rast/dist_asd.tif", 
+                   "arquivos/shapes_utm/shapes_rast/dist_hidrog.tif",
+                   "arquivos/shapes_utm/shapes_rast/dist_incra.tif",
+                   "arquivos/shapes_utm/shapes_rast/dist_mineracao.tif",
+                   "arquivos/shapes_utm/shapes_rast/dist_quilomb.tif",
+                   "arquivos/shapes_utm/shapes_rast/dist_rodovias.tif",
+                   "arquivos/shapes_utm/shapes_rast/dist_urb.tif",
+                   "arquivos/shapes_utm/shapes_rast/dist_uc_federal.tif")
+
+# 2.2 Alinhamento (Resample)
+ref_raster <- mapbiom_1990_rast # Usando 1990 LULC reclassificado como referência
+
+var_exp_align <- lapply(var_exp_paths, function(x) {
+  r <- rast(x)
+  # Usa "bilinear" para variáveis contínuas
+  resample(r, ref_raster, method = "bilinear")
+})
+
+var_exp_stack <- rast(var_exp_align)
+
+# 2.3 Salvamento e Nomenclatura Consistente
+DIR_ALIGN <- "rasters/molusce_inputs/align"
+dir.create(DIR_ALIGN, showWarnings = FALSE, recursive = TRUE)
+
+# Salva os rasters alinhados
+for (i in 1:nlyr(var_exp_stack)) {
+  nome <- names(var_exp_stack)[i]
+  saida <- file.path(DIR_ALIGN, paste0("align_", nome, ".tif"))
+  writeRaster(var_exp_stack[[i]], saida, overwrite=TRUE, NAflag=-9999, gdal=c("COMPRESS=LZW"))
+}
+
+# Carrega o stack final de preditoras
+arquivos_exp <- list.files(DIR_ALIGN, pattern = "align_.*\\.tif$", full.names = TRUE)
+rasters_exp <- rast(arquivos_exp)
+
+# ATENÇÃO: Renomear com os nomes EXATOS da fórmula!
+# Ajuste a ordem dos nomes de acordo com a ordem dos arquivos salvos.
+names(rasters_exp) <- c("ASD", "Hydrography", "INCRA", "Mining", 
+                        "QuilombolaLand", "Railways", "ProtectedArea", "Slope") 
+
+# 2.4 Seleção e Remoção de Camadas (ajuste aqui para a fórmula)
+# Remove camadas não usadas ou com SD zero
+
+rasters_exp_final <- rasters_exp[[VAR_PREDITORAS_MODELO[2:length(VAR_PREDITORAS_MODELO)]]] # Remove 'mapbiom_t' da lista, que será adicionado depois
+
+sd_vals <- global(rasters_exp_final, sd, na.rm = TRUE) 
+constantes <- which(sd_vals$sd == 0 | is.na(sd_vals$sd))
+if (length(constantes) > 0) {
+  message("Removendo camadas sem variação: ", names(rasters_exp_final)[constantes])
+  rasters_exp_final <- rasters_exp_final[[ -constantes ]]
+}
+message("✅ Variáveis explicativas finais: ", paste(names(rasters_exp_final), collapse = ", "))
+
+# --- PARTE 2.5: ANÁLISE DE CORRELAÇÃO DE PEARSON ---
+message("\n--- Analisando Correlação entre Variáveis Explicativas ---")
+
+# 1. Extrair valores das variáveis (removendo NAs para o cálculo)
+# Usar o stack de rasters que já foram alinhados e recortados (rasters_exp_final)
+valores_exp <- as.data.frame(rasters_exp_final, na.rm = TRUE)
+
+# 2. Calcular a Matriz de Correlação de Pearson
+matriz_corr <- cor(valores_exp, method = "pearson")
+
+# Salvar o gráfico em alta resolução para o artigo
+png("resultados/heatmap_correlacao.png", width = 800, height = 800, res = 120)
+corrplot(matriz_corr, 
+         method = "color", 
+         type = "upper", 
+         addCoef.col = "black", # Mostra o valor numérico
+         tl.col = "black", 
+         tl.srt = 45, 
+         diag = FALSE,
+         title = "\nPearson Correlation Matrix - Spatial Drivers (stats)",
+         mar = c(0,0,1,0))
+dev.off()
+
+# 3. Identificar variáveis altamente correlacionadas (ex: > 0.8)
+message("Matriz de correlação calculada e salva em 'resultados/heatmap_correlacao.png'.")
+
+# Mostrar no console as correlações mais fortes
+high_corr <- which(abs(matriz_corr) > 0.8 & abs(matriz_corr) < 1, arr.ind = TRUE)
+if(nrow(high_corr) > 0) {
+  message("Atenção: As seguintes variáveis possuem alta correlação (>0.8):")
+  print(high_corr)
+} else {
+  message("Nenhuma colinearidade extrema (>0.8) detectada.")
+}
+
+# Exportar a tabela de correlação para CSV (para usar no Excel/Artigo)
+write.csv(matriz_corr, "resultados/matriz_pearson.csv")
+print(round(matriz_corr, 2))
+#print(round(high_corr, 2))
+
+# --- PARTE 3: TREINAMENTO DO MODELO AJUSTADO ---
+
+# 3.1 Criação do Data Frame de Treinamento
+# Combinamos as explicativas finais com os rasters de LULC
+training_stack <- c(rasters_exp_final, mapbiom_1990_rast, mapbiom_2000_rast)
+
+# Definimos nomes claros para os anos
+names(training_stack)[nlyr(training_stack)] <- "mapbiom_t1" # Dependente (Ano Final)
+names(training_stack)[nlyr(training_stack)-1] <- "mapbiom_t"  # Independente (Ano Inicial)
+
+training_data <- as.data.frame(training_stack, na.rm = TRUE)
+
+# Garante que as variáveis de LULC sejam Fatores
+training_data$mapbiom_t <- as.factor(training_data$mapbiom_t)
+training_data$mapbiom_t1 <- as.factor(training_data$mapbiom_t1)
+
+# 3.2 Geração DINÂMICA da Fórmula
+# Com exceção da variável dependente (mapbiom_t1)
+colunas_preditoras <- setdiff(names(training_data), "mapbiom_t1")
+
+formula_dinamica <- as.formula(
+  paste("mapbiom_t1 ~", paste(colunas_preditoras, collapse = " + "))
+)
+
+message("Fórmula utilizada: ", format(formula_dinamica))
+
+# 3.3 Treinamento do Modelo
+reglog_model <- multinom(formula_dinamica, data = training_data, MaxNWts = 5000)
+message("✅ Modelo Multinom treinado com variáveis disponíveis.")
+
+
+# --- PARTE 4: GERAÇÃO DOS MAPAS DE PROBABILIDADE (INPUT MOLUSCE) ---
+## Objetivo: Gerar o stack de probabilidades para cada período de transição.
+
+message("\n--- PARTE 4: Geração dos Mapas de Probabilidade para MOLUSCE ---")
+
+DIR_MOLUSCE_INPUTS <- "rasters/molusce_inputs/molusce"
+dir.create(DIR_MOLUSCE_INPUTS, showWarnings = FALSE, recursive = TRUE)
+
+# Função auxiliar para garantir o fator (substitua a função anterior)
+padronizar_fator_lulc <- function(valores_numericos, modelo) {
+  # 1. Obter os níveis de fator que o modelo ESPERA do treinamento
+  niveis_esperados <- modelo$xlevels$mapbiom_t
+  
+  # 2. Criar o fator
+  fator_padronizado <- factor(valores_numericos, levels = niveis_esperados)
+  
+  # Se algum valor em 'valores_numericos' não existir em 'niveis_esperados', ele se torna NA.
+  # Isso é correto, pois o modelo não pode prever classes que nunca viu.
+  return(fator_padronizado)
+}
+
+# Função para gerar e salvar as probabilidades
+gerar_probabilidades <- function(mapbiom_t_rast, rasters_exp_final, reglog_model, ano_inicial, ano_final) {
+  
+  message(paste("Iniciando predição para:", ano_inicial, "->", ano_final))
+  
+  # 1. Cria o stack de preditores
+  predictors_stack <- c(mapbiom_t_rast, rasters_exp_final)
+  names(predictors_stack) <- c("mapbiom_t", names(rasters_exp_final))
+  
+  # 2. Extrai dados e prepara o data frame
+  # Extrai para uma matriz primeiro, que é mais rápida e segura para o 'terra'
+  pred_matrix <- values(predictors_stack)
+  pred_df <- as.data.frame(pred_matrix)
+  
+  # Identifica células válidas (sem NA nas variáveis explicativas)
+  valid_cells_idx <- which(complete.cases(pred_df))
+  pred_df_clean <- pred_df[valid_cells_idx, ]
+  
+  if (nrow(pred_df_clean) == 0) {
+    stop("Não há células válidas para predição neste período.")
+  }
+  
+  # Obtém os níveis de FATOR de LULC que o modelo ESPERA (do treinamento)
+  mapbiom_t_levels <- reglog_model$xlevels$mapbiom_t
+  
+  # ⚠️ CONVERSÃO CRÍTICA: Força 'mapbiom_t' a ser FATOR
+  pred_df_clean$mapbiom_t <- factor(
+    pred_df_clean$mapbiom_t, 
+    levels = mapbiom_t_levels
+  )
+  
+  # 3. Geração das probabilidades usando o predict do NNET
+  # 
+  # A linha que causava o erro C++ provavelmente estava aqui. 
+  # Usar 'as.matrix' imediatamente após o predict resolve muitos problemas do nnet.
+  prob_temp <- predict(reglog_model, newdata = pred_df_clean, type = "prob")
+  prob_matrix <- as.matrix(prob_temp) 
+  
+  
+  # 4. Cria e preenche o raster
+  num_classes <- ncol(prob_matrix)
+  
+  if (is.null(num_classes) || num_classes < 2) {
+    stop(paste("O modelo não retornou probabilidades para múltiplas classes. Número de colunas:", num_classes))
+  }
+  
+  prob_raster_stack <- rast(predictors_stack[[1]]) 
+  prob_raster_stack <- prob_raster_stack[[ rep(1, num_classes) ]] 
+  
+  values_out <- matrix(NA, nrow = nrow(pred_df), ncol = num_classes)
+  
+  # Preenche apenas as células válidas (usando o índice da matriz)
+  values_out[valid_cells_idx, ] <- prob_matrix 
+  
+  values(prob_raster_stack) <- values_out
+  
+  # 5. Renomear e Salvar
+  # Usa os nomes das colunas da matriz (classes preditas)
+  classes <- colnames(prob_matrix) 
+  names(prob_raster_stack) <- paste0("Prob_Trans_", ano_inicial, "_", ano_final, "_Classe_", classes)
+  
+  saida_path <- file.path("rasters/molusce_inputs", paste0("Probabilidades_", ano_inicial, "_", ano_final, ".tif"))
+  writeRaster(prob_raster_stack, saida_path, overwrite=TRUE, gdal=c("COMPRESS=LZW"))
+  
+  message(paste("   -> Probabilidades salvas para:", ano_inicial, "->", ano_final, "(OK)"))
+  
+  return(prob_raster_stack)
+}
+
+# 4.1 Transição de 1990 -> 2000 (Calibração)
+prob_1990_2000 <- gerar_probabilidades(mapbiom_1990_rast, rasters_exp_final, reglog_model, 1990, 2000)
+
+# 4.2 Transição de 2000 -> 2010 (Validação)
+prob_2000_2010 <- gerar_probabilidades(mapbiom_2000_rast, rasters_exp_final, reglog_model, 2000, 2010)
+
+# 4.3 Transição de 2010 -> 2020 (Validação)
+prob_2010_2020 <- gerar_probabilidades(mapbiom_2010_rast, rasters_exp_final, reglog_model, 2010, 2020)
+
+message("✅ Geração de Mapas de Probabilidade concluída.")
+
+
+# --- PARTE 5: VALIDAÇÃO DO MODELO (Opcional, mas recomendado) ---
+## Objetivo: Medir a precisão da predição 2010 vs. o real 2010.
+
+message("\n--- PARTE 5: Validação de Precisão (2000 -> 2010) ---")
+
+# 5.1 Previsão de Classes 2010 (Para Matriz de Confusão)
+predictors_2000_2010 <- c(mapbiom_2000_rast, rasters_exp_final)
+names(predictors_2000_2010) <- c("mapbiom_t", names(rasters_exp_final))
+
+# 5.2. ESSENCIAL: Transformar a camada de LULC do raster em FATOR
+# Quais são as categorias (levels) que o modelo conhece
+levels_treinados <- reglog_model$xlevels$mapbiom_t
+is.factor(predictors_2000_2010$mapbiom_t) # Verificará que é FALSE inicialmente
+
+rat <- data.frame(ID = as.numeric(levels_treinados), class = levels_treinados)
+levels(predictors_2000_2010$mapbiom_t) <- rat
+
+# Previsão de Classes (type="class")
+pred_2010_classes <- terra::predict(
+  predictors_2000_2010, 
+  reglog_model, 
+  type = "class", 
+  na.rm = TRUE
+)
+
+# 5.3 Comparação (Raster -> Data Frame)
+
+pred_vals <- as.numeric(terra::values(pred_2010_classes, mat=FALSE))
+real_vals <- as.numeric(terra::values(mapbiom_2010_rast, mat=FALSE))
+
+table(pred_vals, useNA = "always")
+table(real_vals, useNA = "always")
+
+# TRADUÇÃO DOS ÍNDICES PARA CÓDIGOS REAIS
+
+# 5.4. Obter a legenda original que o modelo usou no treinamento
+legenda_modelo <- levels(training_data$mapbiom_t1) 
+
+# 5.5. Traduzir os índices preditos (1, 2, 3...) de volta para os códigos (3, 4, 15...)
+# O pred_vals extraído anteriormente contém os índices. Vamos mapeá-los:
+pred_codigos_reais <- as.numeric(legenda_modelo[pred_vals])
+
+# 5.6. Criar o Data Frame agora com os números COMPARÁVEIS
+comp_2010 <- data.frame(
+  Predito = pred_codigos_reais,
+  Real = real_vals
+)
+
+comp_2010 <- na.omit(comp_2010)
+
+# 5.7. Gerar a Matriz de Confusão
+niveis_comuns <- sort(unique(c(comp_2010$Predito, comp_2010$Real)))
+
+matriz_2010 <- confusionMatrix(
+  factor(comp_2010$Predito, levels = niveis_comuns), 
+  factor(comp_2010$Real, levels = niveis_comuns)
+)
+
+# 5.8. Exibir o Kappa e a Acurácia corrigidos
+print(matriz_2010$overall)
+message(paste("Valor Kappa de 2000 -> 2010:", round(matriz_2010$overall["Kappa"], 4)))
+
+# Converter a tabela da matriz para data frame
+df_matriz <- as.data.frame(matriz_2010$table)
+
+# Gerar o gráfico
+ggplot(df_matriz, aes(x = Reference, y = Prediction, fill = Freq)) +
+  geom_tile() +
+  geom_text(aes(label = Freq), color = "white") +
+  scale_fill_gradient(low = "blue", high = "red") +
+  labs(title = "Matriz de Confusão: 2000 -> 2010",
+       x = "Real (MapBiomas)",
+       y = "Predito (Modelo)") +
+  theme_minimal()
+
+# Exportar o gráfico em alta resolução
+ggsave("resultados/Matriz_Confusao_2010_R.tiff", width = 8, height = 6, dpi = 300)
+
+
+# --- PARTE 6: PREVISÃO FUTURA (2020 -> 2050) ---
+## Objetivo: Simular os próximos períodos usando o modelo iterativamente.
+
+message("\n--- PARTE 6: Previsão Futura (Probabilidades 2020 -> 2050) ---")
+
+# Estado inicial para 2030 é o dado real de 2020
+mapbiom_t_futuro <- mapbiom_2020_rast
+
+# 6.1 Previsão 2020 -> 2030
+prob_2020_2030 <- gerar_probabilidades(mapbiom_t_futuro, rasters_exp_final, reglog_model, 2020, 2030)
+names(prob_2020_2030)
+
+library(terra)
+library(stringr) # Biblioteca útil para manipular texto
+
+# 1. Função Alocar Classes com Extração Automática de ID
+alocar_classes <- function(prob_raster) {
+  # Encontra o índice da camada com maior probabilidade
+  classe_predita_index <- app(prob_raster, which.max)
+  
+  # Extrair os números dos nomes das camadas (ex: de "Classe_3" para 3)
+  nomes_camadas <- names(prob_raster)
+  ids_extraidos <- as.numeric(str_extract(nomes_camadas, "\\d+$"))
+  
+  # Se a extração falhar (ids_extraidos tiver NA), vamos definir manualmente 
+  # com base na ordem que você me enviou:
+  if(any(is.na(ids_extraidos))) {
+    ids_extraidos <- c(3, 4, 12, 15, 21, 24, 25, 30, 33)
+  }
+  
+  # Matriz de reclassificação: do índice (1, 2, 3...) para o ID Real (3, 4, 12...)
+  reclass_mat <- cbind(1:length(ids_extraidos), ids_extraidos)
+  
+  # Aplicar a reclassificação para ter o mapa com os valores do MapBiomas
+  mapa_final <- classify(classe_predita_index, reclass_mat)
+  names(mapa_final) <- "LULC_Class"
+  
+  return(mapa_final)
+}
+
+# --- 1. PREDIÇÃO PARA 2030 ---
+message("Gerando mapa para 2030...")
+# prob_2020_2030 já foi gerada no seu código anterior
+mapa_2030 <- alocar_classes(prob_2020_2030)
+writeRaster(mapa_2030, "resultados/LULC_LR_2030.tif", overwrite=TRUE)
+
+# --- 2. PREDIÇÃO PARA 2040 ---
+message("Gerando mapa para 2040...")
+# Usamos o mapa de 2030 como entrada para as variáveis de proximidade/vizinhança
+prob_2030_2040 <- gerar_probabilidades(mapa_2030, rasters_exp_final, reglog_model, 2030, 2040)
+mapa_2040 <- alocar_classes(prob_2030_2040)
+writeRaster(mapa_2040, "resultados/LULC_LR_2040.tif", overwrite=TRUE)
+
+# --- 3. PREDIÇÃO PARA 2050 ---
+message("Gerando mapa para 2050...")
+prob_2040_2050 <- gerar_probabilidades(mapa_2040, rasters_exp_final, reglog_model, 2040, 2050)
+mapa_2050 <- alocar_classes(prob_2040_2050)
+writeRaster(mapa_2050, "resultados/LULC_LR_2050.tif", overwrite=TRUE)
+
+message("Processo concluído! Os arquivos .tif estão na sua pasta de trabalho.")
